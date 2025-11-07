@@ -49,6 +49,40 @@ During the same scan the host shifts the command bits (LSB first):
 
 The FIFO depth defaults to 64 bytes in each direction (`FIFO_ADDR_WIDTH = 6`) but can be tuned by changing the bridge parameter.
 
+## Quick Start: Quartus Terminal (quartus_stp)
+Once the FPGA is configured with `jtag_uart_top`, you can exchange bytes directly from a Quartus command prompt—no external
+hardware or Python script required.
+
+1. Open a **Quartus Prime Command Prompt** (Windows) or source the Quartus settings script on Linux so that `quartus_stp` is on
+   your `PATH`. On Windows this is **not** the *Nios II Command Shell*—that launcher relies on WSL on recent Intel FPGA
+   releases. Instead, search the Start menu for *Quartus Prime 23.x Command Prompt* (or similar) and run it; the prompt sets all
+   required environment variables for the Quartus utilities.
+2. Run the interactive console provided in this repository:
+   ```sh
+   quartus_stp -t scripts/jtag_uart_console.tcl
+   ```
+3. The console connects to the first USB-Blaster it finds and prints a small help menu. Useful commands include:
+   - `status` – show the current bridge flags and the last byte returned by the FPGA.
+   - `write <value>` – enqueue a byte for the FPGA (hex such as `0x55` or decimal like `85`).
+   - `read` – fetch one byte if the FPGA has provided data.
+   - `poll` – continuously print bytes as they arrive until you press **Ctrl+C**.
+   - `clear` – clear any overflow indicators that may have latched.
+   - `quit` – exit the console.
+
+If you prefer to craft your own tooling, the Tcl script is short and demonstrates the scan sequence required by
+`jtag_uart_bridge`.
+
+### Windows fallback when the Quartus prompt is unavailable
+If you cannot locate the Quartus Prime Command Prompt entry, you can invoke the tool manually from an ordinary Command
+Prompt or PowerShell window. Replace `<quartus install>` with the directory where Quartus is installed (e.g.,
+`C:\intelFPGA_lite\23.1std\quartus`):
+
+```powershell
+"<quartus install>\bin64\quartus_stp.exe" -t "<path to repo>\scripts\jtag_uart_console.tcl"
+```
+
+This direct invocation avoids the WSL requirement entirely; only the USB-Blaster driver needs to be installed.
+
 ## Example Quartus System Console Session
 1. Launch System Console or run `quartus_stp` and open the USB-Blaster connection:
    ```tcl
