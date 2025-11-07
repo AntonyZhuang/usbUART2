@@ -1,38 +1,101 @@
 # usbUART2 FPGA UART Reference
 
-## Quartus Top-Level for the DE1-SoC Board
-Use `de1_soc_uart_top` as the top-level entity when targeting the DE1-SoC (5CSEMA5F31C6N). It wraps the existing `control`, `uart_rx`, and `uart_tx` modules so the FPGA fabric can drive discrete GPIO pins for a USB-UART dongle.
+## JTAG-Based Top-Level for the DE1-SoC Board
+Use `jtag_uart_top` as the Quartus top-level when targeting the DE1-SoC (5CSEMA5F31C6N). The module keeps the original `control`
+logic but replaces the discrete serial pins with a virtual UART implemented over the USB-Blaster JTAG connection. No external
+USB-to-TTL adapter is required on revision G0 boards—the existing USB-Blaster link handles configuration and byte transport.
 
 ```
-serial_rx  <-- external USB-UART TXD
-serial_tx  --> external USB-UART RXD
-CLOCK_50   <-- DE1-SoC 50 MHz oscillator
-reset_n    <-- push button or GPIO source (active-low)
-baud_select[2:0] <-- slide switches to pick baud (000 = 115200)
-tx_busy_led --> LED indicator wired to busy output
+clk      <-- CLOCK_50 (PIN_AF14)
+rst_n    <-- KEY0 or another active-low reset source
+JTAG     <-> Quartus via USB-Blaster
 ```
 
-## Required Hardware Change on Revision G0
-On the DE1-SoC revision G0 boards the onboard USB UART bridges only to the HPS. The FPGA fabric cannot see traffic that appears on COM3. Attach a USB-to-TTL converter to the GPIO or Arduino header pins you assign to `serial_rx` and `serial_tx` in Pin Planner. Tie the converter ground to the board ground.
+## Files to Add to Your Quartus Project
+Add the following sources:
 
-Suggested assignments (verify with the DE1-SoC manual):
+- `control.v`
+- `fifo.v`
+- `async_fifo.v`
+- `jtag_uart_bridge.v`
+- `jtag_uart_top.v`
 
-| Signal | Location | Notes |
+Set the top-level entity to `jtag_uart_top`, assign the clock and reset pins, then compile and program the generated `.sof` via
+JTAG as usual.
+
+## How the Virtual UART Works
+The bridge exposes a 16-bit data register on the JTAG scan chain. Each scan simultaneously returns FPGA-to-PC data and allows the
+host to enqueue new bytes for the FPGA. The bit fields are:
+
+| Bit(s) | Direction | Meaning |
 | --- | --- | --- |
-| `CLOCK_50` | `PIN_AF14` | Fixed 50 MHz clock input |
-| `reset_n` | `PIN_AA14` | KEY0 push button, active-low |
-| `serial_rx` | `GPIO_0[0]` (e.g., `PIN_AB12`) | Connect to USB-UART TXD |
-| `serial_tx` | `GPIO_0[1]` (e.g., `PIN_AA12`) | Connect to USB-UART RXD |
-| `baud_select[0]` | `SW0` (`PIN_AB28`) | Optional switch for baud control |
-| `baud_select[1]` | `SW1` (`PIN_AC28`) | Optional |
-| `baud_select[2]` | `SW2` (`PIN_AD28`) | Optional |
-| `tx_busy_led` | `LED0` (`PIN_V16`) | Shows transmitter activity |
+| 7:0 | FPGA→PC | Oldest byte waiting for the PC to read. Undefined when `valid` (bit 8) is 0. |
+| 8 | FPGA→PC | `valid` – 1 when a byte is available for the PC. Clear it by issuing a read strobe (bit 9). |
+| 9 | FPGA→PC | `host_ready` – 1 when the bridge can accept a new byte from the PC. |
+| 10 | FPGA→PC | `pc_overflow` – sticky flag set if the PC tried to write while the FIFO was full. Clear with bit 10 in the host command. |
+| 11 | FPGA→PC | `fpga_overflow` – sticky flag set if the FPGA tried to write while the return FIFO was full (should not occur when `busy` is observed). Clear with bit 11 in the host command. |
+| 15:12 | FPGA→PC | Reserved, reads as 0. |
 
-## Programming Flow
-1. Add `control.v`, `fifo.v`, `uart_rx.v`, `uart_tx.v`, and `de1_soc_uart_top.v` to the Quartus project.
-2. Set the top-level entity to `de1_soc_uart_top`.
-3. Assign pins per the table above or your preferred wiring.
-4. Compile and program via JTAG (.sof) using the USB-Blaster.
-5. Connect the external USB-UART dongle to your PC and open the matching COM port at the baud rate selected on the board switches.
+During the same scan the host shifts the command bits (LSB first):
 
-This setup bypasses the HPS-connected USB UART and lets the FPGA logic exchange serial data directly with the PC.
+| Bit(s) | Direction | Purpose |
+| --- | --- | --- |
+| 7:0 | PC→FPGA | Byte to push into the receive FIFO. Only accepted when bit 8 is 1. |
+| 8 | PC→FPGA | `write_strobe` – assert to queue the byte in bits 7:0. |
+| 9 | PC→FPGA | `read_strobe` – assert to drop the byte that was reported in the previous scan. |
+| 10 | PC→FPGA | `clear_pc_overflow` – write 1 to clear bit 10 of the status word. |
+| 11 | PC→FPGA | `clear_fpga_overflow` – write 1 to clear bit 11 of the status word. |
+| 15:12 | PC→FPGA | Must be 0. |
+
+The FIFO depth defaults to 64 bytes in each direction (`FIFO_ADDR_WIDTH = 6`) but can be tuned by changing the bridge parameter.
+
+## Example Quartus System Console Session
+1. Launch System Console or run `quartus_stp` and open the USB-Blaster connection:
+   ```tcl
+   package require ::quartus::jtag
+   set hw_name [lindex [get_hardware_names] 0]
+   set device_name [lindex [get_device_names -hardware_name $hw_name] 0]
+   open_device -hardware_name $hw_name -device_name $device_name
+   set svc [virtual_jtag::open_service]
+   ```
+2. Define a helper procedure that performs a 16-bit scan (LSB first) and prints the status:
+   ```tcl
+   proc uart_scan {svc args} {
+       array set opts {write 0 read 0 clear_pc 0 clear_fpga 0 byte 0}
+       array set opts $args
+       set tdi ""
+       set value [expr {$opts(byte) & 0xFF}]
+       for {set i 0} {$i < 8} {incr i} {append tdi [expr {($value >> $i) & 1}]}
+       append tdi [expr {$opts(write) & 1}]
+       append tdi [expr {$opts(read) & 1}]
+       append tdi [expr {$opts(clear_pc) & 1}]
+       append tdi [expr {$opts(clear_fpga) & 1}]
+       append tdi "0000"
+       set tdo [virtual_jtag::shift_dr -instance_index 0 -length 16 -tdi $tdi]
+       set result 0
+       for {set i 15} {$i >= 0} {incr i -1} {
+           set result [expr {(($result << 1) | ([string index $tdo $i] == "1")) & 0xFFFF}]
+       }
+       puts [format "status=0x%04X data=0x%02X valid=%d ready=%d" \
+                 $result [expr {$result & 0xFF}] [expr {($result >> 8) & 1}] [expr {($result >> 9) & 1}]]
+       return $result
+   }
+   ```
+3. Poll for incoming data and acknowledge it:
+   ```tcl
+   set status [uart_scan $svc]
+   if {[expr {($status >> 8) & 1}]} {
+       # Consume the byte that was presented in the last scan
+       set status [uart_scan $svc read 1]
+   }
+   ```
+4. Transmit a byte to the FPGA when `ready` (bit 9) is 1:
+   ```tcl
+   set status [uart_scan $svc]
+   if {[expr {($status >> 9) & 1}]} {
+       uart_scan $svc write 1 byte 0x55
+   }
+   ```
+
+You can wrap the helper procedure in a loop to build a small console or integrate it into a custom host tool. Because everything
+rides on the USB-Blaster JTAG cable, the design works on revision G0 hardware without any additional serial accessories.
